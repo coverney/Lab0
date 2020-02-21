@@ -8,6 +8,7 @@ import picos as pic
 import networkx as nx
 import itertools
 import cvxopt
+import matplotlib.pyplot as plt
 
 
 class Division:
@@ -92,8 +93,48 @@ class Division:
         '''
 
         saturated_edges = {}
+        rightNodes = list(self.get_team_IDs())
+        rightNodes.remove(teamID)
+        num_teams = len(rightNodes)
 
-        #TODO: implement this
+        for i in range(num_teams):
+            for j in range(i, num_teams):
+                currID = rightNodes[i]
+                againstID = rightNodes[j]
+                if currID == teamID or againstID == teamID or currID == againstID:
+                    continue
+                gamesAgainst = self.teams[currID].get_against(againstID)
+                saturated_edges[(currID,againstID)] = gamesAgainst
+
+
+        # set up the graph to run the max flow algorithm on
+        self.G.add_nodes_from(['S', 'T'] + list(saturated_edges.keys()) + rightNodes)
+        edges = []
+
+        for k,v in saturated_edges.items():
+            # if v == 0:
+            #     continue
+            # flow into node
+            edges.append(('S', k,{'capacity':v,'flow':0}))
+            # flow out of node
+            edges.append((k, k[0],{'capacity':v,'flow':0}))
+            edges.append((k, k[1],{'capacity':v,'flow':0}))
+
+        # Add sink edges
+        us = self.teams[teamID]
+        ourWins = us.wins + us.remaining
+        for n in rightNodes:
+            them = self.teams[n]
+            diff = ourWins - them.wins
+            # if diff == 0:
+            #     continue
+            if diff < 0:
+                print("Graph has negative capacity")
+            edges.append((n, 'T',{'capacity':diff,'flow':0}))
+
+        self.G.add_edges_from(edges)
+
+
 
         return saturated_edges
 
@@ -107,10 +148,39 @@ class Division:
         the amount of additional games they have against each other
         return: True if team is eliminated, False otherwise
         '''
+        max_flow, flow_dict = nx.maximum_flow(self.G, 'S', 'T')
+        for edge in self.G.edges():
+            u, v = edge
+            self.G.edges[u, v]['flow'] = flow_dict[u][v]
 
-        #TODO: implement this
+        self.layout=nx.bipartite_layout(self.G, ['S'])
+        self.draw_graph(self.layout)
 
+        for edge in self.G.edges('S'):
+            u, v = edge
+            if flow_dict[u][v] < self.G.edges[u, v]['capacity']:
+                return True
         return False
+
+    def draw_graph(self, layout):
+        """Draws a nice representation of a networkx graph object.
+        Source: https://notebooks.azure.com/coells/projects/100days/html/day%2049%20-%20ford-fulkerson.ipynb"""
+
+        plt.figure(figsize=(12, 4))
+        plt.axis('off')
+
+        nx.draw_networkx_nodes(self.G, layout, node_color='lightblue', node_size=800)
+        nx.draw_networkx_edges(self.G, layout, edge_color='gray', arrowsize=30)
+        nx.draw_networkx_labels(self.G, layout, font_color='black', font_size=16)
+
+        for u, v, e in self.G.edges(data=True):
+            label = '{}/{}'.format(e['flow'], e['capacity'])
+            color = 'green' if e['flow'] < e['capacity'] else 'red'
+            x = layout[u][0] * .6 + layout[v][0] * .4
+            y = layout[u][1] * .6 + layout[v][1] * .4
+            t = plt.text(x, y, label, size=16, color=color,
+                         horizontalalignment='center', verticalalignment='center')
+        plt.show()
 
     def linear_programming(self, saturated_edges):
         '''Uses linear programming to determine if the team with given team ID
@@ -123,11 +193,58 @@ class Division:
         the amount of additional games they have against each other
         returns True if team is eliminated, False otherwise
         '''
-
         maxflow=pic.Problem()
-
-        #TODO: implement this
-
+        # Generate edge capacities.
+        c={}
+        for e in self.G.edges():
+            u, v = e
+            capacity = self.G.edges[u, v]['capacity']
+            c[(u, v)]  = capacity
+        # Convert the capacities to a PICOS expression.
+        cc=pic.new_param('c',c)
+        s = 'S'
+        t = 'T'
+        # add the flow variables
+        f = {}
+        for e in self.G.edges():
+            f[e] = maxflow.add_variable('f[{0}]'.format(e),1)
+        # add another variable for the total flow
+        F = maxflow.add_variable('F',1)
+        # enforce edge capacities
+        maxflow.add_list_of_constraints(
+            [f[e]<=cc[e] for e in self.G.edges()],
+            [('e', 2)],
+            'edges')
+        # enforce flow conservation
+        maxflow.add_list_of_constraints(
+            [pic.sum([f[p,i] for p in self.G.predecessors(i)],'p','pred(i)')
+                == pic.sum([f[i,j] for j in self.G.successors(i)],'j','succ(i)')
+                for i in self.G.nodes if i not in (s,t)],
+                'i','nodes-(s,t)')
+        # set source flow at 'S'
+        maxflow.add_constraint(
+            pic.sum([f[p,s] for p in self.G.predecessors(s)],'p','pred(s)') + F
+            == pic.sum([f[s,j] for j in self.G.successors(s)],'j','succ(s)'))
+        # Set sink flow at T.
+        maxflow.add_constraint(
+          pic.sum([f[p,t] for p in self.G.predecessors(t)],'p','pred(t)')
+          == pic.sum([f[t,j] for j in self.G.successors(t)],'j','succ(t)') + F)
+        # Enforce flow nonnegativity.
+        maxflow.add_list_of_constraints(
+          [f[e]>=0 for e in self.G.edges()], # list of constraints
+          [('e',2)],                   # e is a double index
+          'edges')                     # set the index belongs to
+        # Set the objective.
+        maxflow.set_objective('max',F)
+        # print(pic.solvers.available_solvers(maxflow))
+        # print(maxflow)
+        # Solve the problem.
+        sol = maxflow.solve(verbose=3,solver='cvxopt')
+        # flow = pic.tools.eval_dict(f)
+        # for edge in self.G.edges('S'):
+        #     u, v = edge
+        #     if self.G.edges[u, v]['flow'] < self.G.edges[u, v]['capacity']:
+        #         return True
         return False
 
 
@@ -190,6 +307,7 @@ if __name__ == '__main__':
         filename = sys.argv[1]
         division = Division(filename)
         for (ID, team) in division.teams.items():
-            print(f'{team.name}: Eliminated? {division.is_eliminated(team.ID, "Linear Programming")}')
+            # if team.name == 'Team13':
+                print(f'{team.name}: Eliminated? {division.is_eliminated(team.ID, "Linear Programming")}')
     else:
         print("To run this code, please specify an input file name. Example: python baseball_elimination.py teams2.txt.")
